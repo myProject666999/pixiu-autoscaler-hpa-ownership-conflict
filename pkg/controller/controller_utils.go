@@ -20,6 +20,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -127,16 +128,13 @@ func CreateHPAFromDeployment(d *appsv1.Deployment) (*autoscalingv2.HorizontalPod
 		Metrics: metrics,
 	}
 
-	// 生成名称后缀
-	hpaNameHash := computeHash(d.Name)
-
 	return &autoscalingv2.HorizontalPodAutoscaler{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       HorizontalPodAutoscaler,
 			APIVersion: AutoscalingAPIVersion,
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      d.Name + "-" + hpaNameHash,
+			Name:      HPANameForDeployment(d),
 			Namespace: namespace,
 			OwnerReferences: []metav1.OwnerReference{
 				ownerReference,
@@ -145,6 +143,63 @@ func CreateHPAFromDeployment(d *appsv1.Deployment) (*autoscalingv2.HorizontalPod
 		},
 		Spec: spec,
 	}, nil
+}
+
+// HPANameForDeployment 返回 Deployment 对应的期望 HPA 名称（按 Deployment 名确定性生成）。
+func HPANameForDeployment(d *appsv1.Deployment) string {
+	return d.GetName() + "-" + computeHash(d.GetName())
+}
+
+// ManagedHPAFields 公开本控制器负责管理的 HPA 字段清单。
+// 同步时只允许覆盖这些字段；用户自行添加的 Spec.Behavior、
+// 无关的注解与标签必须原样保留，不允许整体对象替换。
+var ManagedHPAFields = []string{
+	"spec.minReplicas",
+	"spec.maxReplicas",
+	"spec.metrics",
+	"spec.scaleTargetRef",
+	"metadata.labels[" + PrometheusCustomMetric + "]",
+}
+
+// ApplyManagedHPAFields 将 desired 中由控制器管理的字段（见 ManagedHPAFields）
+// 合并到 target 上，target 的其余字段（含 Spec.Behavior、用户注解与标签）保持不变。
+// customMetric 表示该 Deployment 是否启用 prometheus 自定义指标（对应受管标签）。
+// 返回是否有受管字段发生变化。
+func ApplyManagedHPAFields(target, desired *autoscalingv2.HorizontalPodAutoscaler, customMetric bool) bool {
+	changed := false
+
+	if !reflect.DeepEqual(target.Spec.MinReplicas, desired.Spec.MinReplicas) {
+		target.Spec.MinReplicas = desired.Spec.MinReplicas
+		changed = true
+	}
+	if target.Spec.MaxReplicas != desired.Spec.MaxReplicas {
+		target.Spec.MaxReplicas = desired.Spec.MaxReplicas
+		changed = true
+	}
+	if !reflect.DeepEqual(target.Spec.Metrics, desired.Spec.Metrics) {
+		target.Spec.Metrics = desired.Spec.Metrics
+		changed = true
+	}
+	if !reflect.DeepEqual(target.Spec.ScaleTargetRef, desired.Spec.ScaleTargetRef) {
+		target.Spec.ScaleTargetRef = desired.Spec.ScaleTargetRef
+		changed = true
+	}
+
+	// 受管标签：prometheus 自定义指标标记
+	_, hasLabel := target.Labels[PrometheusCustomMetric]
+	if customMetric && !hasLabel {
+		if target.Labels == nil {
+			target.Labels = make(map[string]string)
+		}
+		target.Labels[PrometheusCustomMetric] = "true"
+		changed = true
+	}
+	if !customMetric && hasLabel {
+		delete(target.Labels, PrometheusCustomMetric)
+		changed = true
+	}
+
+	return changed
 }
 
 func computeHash(objectToWrite string) string {
@@ -279,6 +334,9 @@ func parseMetricSpecForPrometheus(target string, metricType string, metricValue 
 	return metricSpec, nil
 }
 
+// IsOwnerReference 是通用工具函数：判断 uid 是否出现在 ownerReferences 中。
+// 注意：同步路径的所有权判定不依赖该函数，统一以 controller ownerReference
+// 的 UID/Kind/Name 完全匹配为准。
 func IsOwnerReference(uid types.UID, ownerReferences []metav1.OwnerReference) bool {
 	var isOwnerRef bool
 	for _, ownerReference := range ownerReferences {
@@ -290,12 +348,13 @@ func IsOwnerReference(uid types.UID, ownerReferences []metav1.OwnerReference) bo
 	return isOwnerRef
 }
 
+// ManageByPixiuController 仅用于诊断/观测：报告 HPA 是否曾被本控制器写入过。
+// 注意：managedFields 中的 manager 名称不构成接管授权，不得据此修改或删除
+// 任何对象；所有权判定只能依据 controller ownerReference 的 UID/Kind/Name。
 func ManageByPixiuController(hpa *autoscalingv2.HorizontalPodAutoscaler) bool {
 	for _, managedField := range hpa.ManagedFields {
 		if managedField.APIVersion == AutoscalingAPIVersion &&
-			(managedField.Manager == PixiuManager ||
-				// This condition used for local run
-				managedField.Manager == PixiuMain) {
+			managedField.Manager == PixiuManager {
 			return true
 		}
 	}

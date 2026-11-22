@@ -17,8 +17,11 @@ limitations under the License.
 package controller
 
 const (
-	PixiuManager    string = "kubez-autoscaler-controller"
-	PixiuMain       string = "main" // Just for local test
+	// PixiuManager 是本控制器写入 managedFields 时使用的 manager 名称，
+	// 与 cmd/app/options 中的 PixiuControllerManagerUserAgent 保持一致。
+	// 注意：该名称仅用于诊断观测（见 ManageByPixiuController），
+	// 不构成对任何 HPA 的接管授权。
+	PixiuManager    string = "pixiu-autoscaler-controller"
 	PixiuRootPrefix string = "hpa.caoyingjunz.io"
 	PixiuSeparator  string = "/"
 	PixiuDot        string = "."

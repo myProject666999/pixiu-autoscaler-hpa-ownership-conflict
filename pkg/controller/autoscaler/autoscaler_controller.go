@@ -21,6 +21,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v2"
@@ -31,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -54,6 +58,33 @@ import (
 
 const (
 	maxRetries = 15
+
+	// maxUpdateConflictRetries 更新托管 HPA 时乐观锁冲突的最大重试次数。
+	// 每次冲突都重新读取、重新判断归属并合并受管字段，不盲目重放旧对象。
+	maxUpdateConflictRetries = 3
+)
+
+// 事件原因
+const (
+	reasonFailedNewestHPA = "FailedNewestHPA"
+	reasonCreateHPA       = "CreateHPA"
+	reasonFailedCreateHPA = "FailedCreateHPA"
+	reasonUpdateHPA       = "UpdateHPA"
+	reasonFailedUpdateHPA = "FailedUpdateHPA"
+	reasonDeleteHPA       = "DeleteHPA"
+	reasonFailedDeleteHPA = "FailedDeleteHPA"
+	// reasonHPAConflict 存在非托管但冲突的 HPA（占用期望名称或指向同一伸缩目标）
+	reasonHPAConflict = "HPAConflict"
+	// reasonOrphanedHPA 同名 Deployment 重建后遗留的旧 UID HPA，等待垃圾回收
+	reasonOrphanedHPA = "OrphanedHPA"
+)
+
+var (
+	// orphanRequeueDelay 是等待旧 UID HPA 被垃圾回收时的重新入队间隔。
+	// 该等待走独立的延时入队，不消耗 maxRetries 的配置失败重试计数。
+	orphanRequeueDelay = 10 * time.Second
+	// eventDedupInterval 是相同冲突事件的最小重复间隔，避免同一冲突反复刷事件。
+	eventDedupInterval = 10 * time.Minute
 )
 
 // AutoscalerController is responsible for synchronizing HPA objects stored
@@ -89,6 +120,11 @@ type AutoscalerController struct {
 
 	// Store and returns a reference to an empty store.
 	items map[string]controller.Empty
+
+	// eventLock 保护 lastEventAt。
+	eventLock sync.Mutex
+	// lastEventAt 记录同类事件上次发出的时间，用于冲突事件去重。
+	lastEventAt map[string]time.Time
 }
 
 // NewAutoscalerController creates a new AutoscalerController.
@@ -353,58 +389,213 @@ func (ac *AutoscalerController) syncAutoscalers(key string) error {
 		return nil
 	}
 
-	hpaList, err := ac.getHPAsForDeployment(d)
+	hpaList, err := ac.hpaLister.HorizontalPodAutoscalers(namespace).List(labels.Everything())
 	if err != nil {
 		return err
 	}
-	return ac.sync(d, hpaList)
+	c := classifyHPAs(d, controller.HPANameForDeployment(d), hpaList)
+
+	// 同名 Deployment 删除重建后，旧 UID 的 HPA 可能尚未被垃圾回收。
+	// 不立即接管、不删除、也不新建（期望名称可能仍被旧对象占用），
+	// 以独立的等待状态短期重新入队，不消耗配置失败的重试计数。
+	if ac.IsDeploymentControlHPA(d) && len(c.managed) == 0 && len(c.orphans) > 0 {
+		ac.emitWarningEventDeduped(key, reasonOrphanedHPA, d,
+			fmt.Sprintf("Waiting for garbage collection of HPA(s) %s owned by the previous incarnation of Deployment %s/%s",
+				hpaNames(c.orphans), namespace, name))
+		ac.queue.AddAfter(key, orphanRequeueDelay)
+		return nil
+	}
+
+	return ac.sync(d, c)
 }
 
-func (ac *AutoscalerController) sync(d *appsv1.Deployment, hpaList []*autoscalingv2.HorizontalPodAutoscaler) error {
-	// 1. deployment 存在，但是 hpa 注释不存在 => 移除已存在的 hpa
+// hpaClassification 按与 Deployment 的关系对命名空间内的 HPA 分类，
+// 用于明确管理边界：只有 managed 属于当前授权范围。
+type hpaClassification struct {
+	// managed 由当前 Deployment 托管（controllerRef 的 UID/Kind/Name 完全匹配）
+	managed []*autoscalingv2.HorizontalPodAutoscaler
+	// orphans 属于同名旧 Deployment（controllerRef 的 Kind/Name 相同但 UID 不同），
+	// 等待垃圾回收，不接管、不修改、不删除
+	orphans []*autoscalingv2.HorizontalPodAutoscaler
+	// conflicts 非托管但与本 Deployment 冲突：占用了期望 HPA 名称，
+	// 或 ScaleTargetRef 的 apiVersion/kind/name 指向同一目标
+	conflicts []*autoscalingv2.HorizontalPodAutoscaler
+}
+
+// classifyHPAs 将命名空间内的 HPA 按归属分类。所有权判定的唯一依据是
+// controller ownerReference 的 UID/Kind/Name，不使用 managedFields 或标签猜测。
+func classifyHPAs(d *appsv1.Deployment, expectedName string, hpaList []*autoscalingv2.HorizontalPodAutoscaler) hpaClassification {
+	var c hpaClassification
+	for _, hpa := range hpaList {
+		if isManagedByDeployment(hpa, d) {
+			c.managed = append(c.managed, hpa)
+			continue
+		}
+		if ref := metav1.GetControllerOf(hpa); ref != nil &&
+			ref.Kind == controller.Deployment && ref.Name == d.Name {
+			// UID 不同：同名 Deployment 删除重建后遗留的旧 HPA
+			c.orphans = append(c.orphans, hpa)
+			continue
+		}
+		if hpa.Name == expectedName || targetsDeployment(hpa, d) {
+			c.conflicts = append(c.conflicts, hpa)
+		}
+	}
+	return c
+}
+
+// isManagedByDeployment 判断 HPA 是否由该 Deployment 托管。
+// 这是唯一所有权判定依据：controller ownerReference 的 UID、Kind、名称完全匹配。
+func isManagedByDeployment(hpa *autoscalingv2.HorizontalPodAutoscaler, d *appsv1.Deployment) bool {
+	ref := metav1.GetControllerOf(hpa)
+	return ref != nil &&
+		ref.UID == d.UID &&
+		ref.Kind == controller.Deployment &&
+		ref.Name == d.Name
+}
+
+// targetsDeployment 判断 HPA 的 ScaleTargetRef 是否指向该 Deployment。
+func targetsDeployment(hpa *autoscalingv2.HorizontalPodAutoscaler, d *appsv1.Deployment) bool {
+	ref := hpa.Spec.ScaleTargetRef
+	return ref.APIVersion == controller.AppsAPIVersion &&
+		ref.Kind == controller.Deployment &&
+		ref.Name == d.Name
+}
+
+func hpaNames(hpas []*autoscalingv2.HorizontalPodAutoscaler) string {
+	names := make([]string, 0, len(hpas))
+	for _, hpa := range hpas {
+		names = append(names, hpa.Name)
+	}
+	return "[" + strings.Join(names, " ") + "]"
+}
+
+// emitWarningEventDeduped 发出 Warning 事件；相同 (key, reason, message) 的事件
+// 在 eventDedupInterval 内只发一次，避免同一冲突在每次同步时反复刷事件。
+func (ac *AutoscalerController) emitWarningEventDeduped(key, reason string, obj runtime.Object, message string) {
+	ac.eventLock.Lock()
+	defer ac.eventLock.Unlock()
+	if ac.lastEventAt == nil {
+		ac.lastEventAt = make(map[string]time.Time)
+	}
+	eventKey := key + "|" + reason + "|" + message
+	if last, ok := ac.lastEventAt[eventKey]; ok && time.Since(last) < eventDedupInterval {
+		return
+	}
+	ac.lastEventAt[eventKey] = time.Now()
+	ac.eventRecorder.Event(obj, v1.EventTypeWarning, reason, message)
+}
+
+// sortManagedHPAs 对托管 HPA 确定性排序：期望名称优先，其次创建时间早的优先，
+// 仍相同再按名称字典序。排序后第一个为保留对象，其余删除。
+func sortManagedHPAs(hpas []*autoscalingv2.HorizontalPodAutoscaler, expectedName string) {
+	sort.SliceStable(hpas, func(i, j int) bool {
+		iExpected := hpas[i].Name == expectedName
+		jExpected := hpas[j].Name == expectedName
+		if iExpected != jExpected {
+			return iExpected
+		}
+		ti, tj := hpas[i].CreationTimestamp, hpas[j].CreationTimestamp
+		if !ti.Equal(&tj) {
+			return ti.Before(&tj)
+		}
+		return hpas[i].Name < hpas[j].Name
+	})
+}
+
+func (ac *AutoscalerController) sync(d *appsv1.Deployment, c hpaClassification) error {
+	// 1. deployment 存在，但是 hpa 注释不存在 => 移除已存在的 hpa。
+	//    仅删除当前授权范围内（本 Deployment UID 托管）的 HPA，非托管对象始终保留。
 	if !ac.IsDeploymentControlHPA(d) {
-		return ac.deleteHPAsInBatch(hpaList)
+		return ac.deleteHPAsInBatch(d, c.managed)
 	}
 
 	newHPA, err := controller.CreateHPAFromDeployment(d)
 	if err != nil {
-		ac.eventRecorder.Eventf(d, v1.EventTypeWarning, "FailedNewestHPA", fmt.Sprintf("Failed extract newest HPA %s/%s", d.GetNamespace(), d.GetName()))
+		ac.eventRecorder.Eventf(d, v1.EventTypeWarning, reasonFailedNewestHPA, fmt.Sprintf("Failed extract newest HPA %s/%s", d.GetNamespace(), d.GetName()))
 		return err
 	}
-	if ac.IsCustomMetricHPA(d) {
+	customMetric := ac.IsCustomMetricHPA(d)
+	if customMetric {
 		newHPA.Labels[controller.PrometheusCustomMetric] = "true"
 	}
 
-	if len(hpaList) == 0 {
+	if len(c.managed) == 0 {
+		// 存在冲突的非托管 HPA：不接管、不修改、不删除，也不创建，
+		// 避免出现第二个伸缩控制器。记录名称冲突后继续。
+		if len(c.conflicts) > 0 {
+			ac.emitWarningEventDeduped(d.Namespace+"/"+d.Name, reasonHPAConflict, d,
+				fmt.Sprintf("HPA(s) %s conflict with Deployment %s/%s (same name or same scale target); skip creating HPA %s to avoid duplicate autoscalers",
+					hpaNames(c.conflicts), d.Namespace, d.Name, newHPA.Name))
+			return nil
+		}
 		// 新建
 		_, err = ac.client.AutoscalingV2().HorizontalPodAutoscalers(newHPA.Namespace).Create(context.TODO(), newHPA, metav1.CreateOptions{})
 		if err != nil {
-			ac.eventRecorder.Eventf(newHPA, v1.EventTypeWarning, "FailedCreateHPA", fmt.Sprintf("Failed to create HPA %s/%s: %v", newHPA.Namespace, newHPA.Name, err))
+			ac.eventRecorder.Eventf(newHPA, v1.EventTypeWarning, reasonFailedCreateHPA, fmt.Sprintf("Failed to create HPA %s/%s: %v", newHPA.Namespace, newHPA.Name, err))
 			return err
 		}
-		ac.eventRecorder.Eventf(newHPA, v1.EventTypeNormal, "CreateHPA", fmt.Sprintf("Create HPA %s/%s success", newHPA.Namespace, newHPA.Name))
+		ac.eventRecorder.Eventf(newHPA, v1.EventTypeNormal, reasonCreateHPA, fmt.Sprintf("Create HPA %s/%s success", newHPA.Namespace, newHPA.Name))
 	} else {
-		// 更新 if necessary
-		oldHPA := hpaList[0]
-		if err := ac.deleteHPAsInBatch(hpaList[1:]); err != nil {
+		// 多个托管 HPA：确定性保留一个（期望名称优先，其次创建时间，再按名称），其余删除
+		sortManagedHPAs(c.managed, newHPA.Name)
+		kept := c.managed[0]
+		if err := ac.deleteHPAsInBatch(d, c.managed[1:]); err != nil {
 			return err
 		}
 
-		if reflect.DeepEqual(oldHPA.Spec, newHPA.Spec) {
+		// 仅更新约定由控制器管理的字段（见 controller.ManagedHPAFields），
+		// 用户的 Spec.Behavior、无关注解与标签原样保留
+		updated, err := ac.updateManagedHPA(d, kept, newHPA, customMetric)
+		if err != nil {
+			ac.eventRecorder.Eventf(newHPA, v1.EventTypeWarning, reasonFailedUpdateHPA, fmt.Sprintf("Failed to update HPA %s/%s: %v", newHPA.Namespace, newHPA.Name, err))
+			klog.Errorf("Failed to update HPA %s/%s %v", newHPA.Namespace, newHPA.Name, err)
+			return err
+		}
+		if !updated {
 			klog.V(2).Infof("HPA: %s/%s is not changed", newHPA.Namespace, newHPA.Name)
 			return nil
 		}
-		if _, err = ac.client.AutoscalingV2().HorizontalPodAutoscalers(newHPA.Namespace).Update(context.TODO(), newHPA, metav1.UpdateOptions{}); err != nil {
-			if !errors.IsNotFound(err) {
-				ac.eventRecorder.Eventf(newHPA, v1.EventTypeWarning, "FailedUpdateHPA", fmt.Sprintf("Failed to Recover update HPA %s/%s", newHPA.Namespace, newHPA.Name))
-				klog.Errorf("Failed to update HPA %s/%s %v", newHPA.Namespace, newHPA.Name, err)
-				return err
-			}
-		}
-		ac.eventRecorder.Eventf(newHPA, v1.EventTypeNormal, "UpdateHPA", fmt.Sprintf("Update HPA %s/%s success", newHPA.Namespace, newHPA.Name))
+		ac.eventRecorder.Eventf(newHPA, v1.EventTypeNormal, reasonUpdateHPA, fmt.Sprintf("Update HPA %s/%s success", newHPA.Namespace, newHPA.Name))
 	}
 
 	return ac.Notify(d)
+}
+
+// updateManagedHPA 仅将控制器管理的字段写入 kept 所指的 HPA。
+// 更新携带正确的 resourceVersion；遇到冲突时重新读取、重新判断归属，
+// 并在有界次数内合并重试，不盲目重放旧对象。返回是否真正发生了更新。
+func (ac *AutoscalerController) updateManagedHPA(d *appsv1.Deployment, kept, desired *autoscalingv2.HorizontalPodAutoscaler, customMetric bool) (bool, error) {
+	current := kept
+	for attempt := 0; attempt < maxUpdateConflictRetries; attempt++ {
+		merged := current.DeepCopy()
+		if !controller.ApplyManagedHPAFields(merged, desired, customMetric) {
+			return false, nil
+		}
+		if _, err := ac.client.AutoscalingV2().HorizontalPodAutoscalers(merged.Namespace).Update(context.TODO(), merged, metav1.UpdateOptions{}); err != nil {
+			if errors.IsNotFound(err) {
+				// 已被删除，下次同步按需重建
+				return false, nil
+			}
+			if !errors.IsConflict(err) {
+				return false, err
+			}
+			// 冲突：重新读取最新对象并重新确认归属后再合并
+			fresh, getErr := ac.client.AutoscalingV2().HorizontalPodAutoscalers(kept.Namespace).Get(context.TODO(), kept.Name, metav1.GetOptions{})
+			if getErr != nil {
+				return false, getErr
+			}
+			if !isManagedByDeployment(fresh, d) {
+				return false, fmt.Errorf("HPA %s/%s is no longer managed by Deployment %s/%s, abort update",
+					kept.Namespace, kept.Name, d.Namespace, d.Name)
+			}
+			current = fresh
+			continue
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("failed to update HPA %s/%s: still conflicting after %d retries",
+		kept.Namespace, kept.Name, maxUpdateConflictRetries)
 }
 
 func (ac *AutoscalerController) Notify(d *appsv1.Deployment) error {
@@ -444,23 +635,31 @@ func (ac *AutoscalerController) Notify(d *appsv1.Deployment) error {
 	return nil
 }
 
-func (ac *AutoscalerController) deleteHPAsInBatch(hpaList []*autoscalingv2.HorizontalPodAutoscaler) error {
+// deleteHPAsInBatch 删除当前授权范围内（本 Deployment UID 托管）的 HPA。
+// 删除前再次确认归属，非托管对象一律保留。
+func (ac *AutoscalerController) deleteHPAsInBatch(d *appsv1.Deployment, hpaList []*autoscalingv2.HorizontalPodAutoscaler) error {
 	if len(hpaList) == 0 {
 		return nil
 	}
 	for _, hpa := range hpaList {
+		if !isManagedByDeployment(hpa, d) {
+			klog.Warningf("Skip deleting HPA %s/%s: not managed by Deployment %s/%s", hpa.Namespace, hpa.Name, d.Namespace, d.Name)
+			continue
+		}
 		if err := ac.client.AutoscalingV2().HorizontalPodAutoscalers(hpa.Namespace).Delete(context.TODO(), hpa.Name, metav1.DeleteOptions{}); err != nil {
 			if !errors.IsNotFound(err) {
-				ac.eventRecorder.Eventf(hpa, v1.EventTypeWarning, "FailedDeleteHPA", fmt.Sprintf("Failed to delete HPA %s/%s", hpa.Namespace, hpa.Name))
+				ac.eventRecorder.Eventf(hpa, v1.EventTypeWarning, reasonFailedDeleteHPA, fmt.Sprintf("Failed to delete HPA %s/%s", hpa.Namespace, hpa.Name))
 				return err
 			}
 		}
-		ac.eventRecorder.Eventf(hpa, v1.EventTypeNormal, "DeleteHPA", fmt.Sprintf("Delete HPA %s/%s", hpa.Namespace, hpa.Name))
+		ac.eventRecorder.Eventf(hpa, v1.EventTypeNormal, reasonDeleteHPA, fmt.Sprintf("Delete HPA %s/%s", hpa.Namespace, hpa.Name))
 	}
 
 	return nil
 }
 
+// getHPAsForDeployment 返回由该 Deployment 托管的 HPA 列表，
+// 通过 controllerRef 的 UID、Kind、名称识别。
 func (ac *AutoscalerController) getHPAsForDeployment(d *appsv1.Deployment) ([]*autoscalingv2.HorizontalPodAutoscaler, error) {
 	hpaList, err := ac.hpaLister.HorizontalPodAutoscalers(d.Namespace).List(labels.Everything())
 	if err != nil {
@@ -469,11 +668,7 @@ func (ac *AutoscalerController) getHPAsForDeployment(d *appsv1.Deployment) ([]*a
 
 	var wanted []*autoscalingv2.HorizontalPodAutoscaler
 	for _, hpa := range hpaList {
-		controllerRef := metav1.GetControllerOf(hpa)
-		if controllerRef == nil {
-			continue
-		}
-		if d.UID == controllerRef.UID && controllerRef.Kind == controller.Deployment && controllerRef.Name == d.Name {
+		if isManagedByDeployment(hpa, d) {
 			wanted = append(wanted, hpa)
 		}
 	}
